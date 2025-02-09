@@ -16,7 +16,6 @@ int main(int argc, char** argv) {
     /* Create sockets */
     int sockfd = socket(AF_INET, SOCK_DGRAM, 0);
     // use IPv4  use UDP
-
     /* Construct our address */
     struct sockaddr_in server_addr;
     server_addr.sin_family = AF_INET; // use IPv4

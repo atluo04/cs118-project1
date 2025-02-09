@@ -4,86 +4,107 @@
 #include "consts.h"
 #include <fcntl.h>
 #include <time.h>
+#include <errno.h>
+
+void fill_packet(packet *pkt, uint16_t seq, uint16_t ack, uint16_t flags, uint8_t *payload, size_t payload_len)
+{
+    pkt->seq = htons(seq);
+    pkt->ack = htons(ack);
+    pkt->flags = flags;
+
+    if (payload && payload_len > 0)
+    {
+        memcpy(pkt->payload, payload, payload_len);
+        pkt->length = htons(payload_len);
+    }
+    else
+    {
+        memset(pkt->payload, 0, MAX_PAYLOAD);
+        pkt->length = 0;
+    }
+}
 
 // Main function of transport layer; never quits
 void listen_loop(int sockfd, struct sockaddr_in* addr, int type,
                  ssize_t (*input_p)(uint8_t*, size_t),
                  void (*output_p)(uint8_t*, size_t)) {
-
     char buffer[MAX_PAYLOAD];
     bool connected = false;
     int seq = 0;
     int ack = 0;
-    srand(time(NULL));
+    srand(time(NULL) ^ type);
 
     fcntl(sockfd, F_SETFL, fcntl(sockfd, F_GETFL, 0) | O_NONBLOCK);
 
-    uint8_t in_buf[sizeof(packet) + MAX_PAYLOAD] = {0};
-    packet *in_pkt = (packet *)in_buf;
+    char in_buf[sizeof(packet) + MAX_PAYLOAD] = {0};
+    packet* in_pkt = (packet *)in_buf;
 
-    uint8_t out_buf[sizeof(packet) + MAX_PAYLOAD] = {0};
+    char out_buf[sizeof(packet) + MAX_PAYLOAD] = {0};
     packet *out_pkt = (packet *) out_buf;
-    while (true) { 
+
+    while (true) {
         ssize_t input_len = input_p((uint8_t *)buffer, MAX_PAYLOAD);
-
-        socklen_t addr_len = sizeof(*addr);
+        socklen_t addr_len = sizeof(struct sockaddr_in);
         int bytes_recvd = recvfrom(sockfd, in_pkt, sizeof(packet) + MAX_PAYLOAD, 0,
-                                   (struct sockaddr *)&addr, &addr_len);
+                                   (struct sockaddr *)addr, &addr_len);
 
-        if (input_len > 0)
-        {
-            memcpy(out_pkt->payload, buffer, input_len);
-            out_pkt->length = htons(input_len);
-        }
-        else
-        {
-            out_pkt->length = 0;
-            memset(out_pkt->payload, 0, MAX_PAYLOAD);
-        }
 
         if(type == CLIENT)
         {
             if(!connected){
                 seq = (rand() % 1000 + 1);
-                out_pkt->seq = htons(seq);
-                out_pkt->flags = SYN;
-
+                fill_packet(out_pkt, seq, 0, SYN, buffer, input_len);
+                print_diag(out_pkt, SEND);
                 sendto(sockfd, out_pkt, sizeof(packet) + MAX_PAYLOAD, 0, (struct sockaddr *)addr, sizeof(*addr));
                 connected = true;
             }
             else if(bytes_recvd > 0){
-                if ((in_pkt->flags & SYN) && (in_pkt->flags & ACK))
-                {
-                    out_pkt->flags |= ACK;
-                    out_pkt->ack = htons(in_pkt->seq + 1);
-                    out_pkt->seq = htons(seq);
+                if (in_pkt->flags & SYN){
+                    print_diag(in_pkt, RECV);
+                    output_p(in_pkt->payload, ntohs(in_pkt->length));
+                    ack += ntohs(in_pkt->length);
+                    if (input_len == 0)
+                    {
+                        seq = 0;
+                    }
+                    fill_packet(out_pkt, seq, ntohs(in_pkt->seq) + 1, ACK, buffer, input_len);
+                    print_diag(out_pkt, SEND);
+                    sendto(sockfd, out_pkt, sizeof(packet) + MAX_PAYLOAD, 0,  (struct sockaddr *)addr, sizeof(*addr));
                 }
-                if (in_pkt->length > 0)
-                {
-                    output_p(in_pkt->payload, in_pkt->length);
-                    ack += in_pkt->length;
-                }
+                else {
 
-                sendto(sockfd, out_pkt, sizeof(packet) + MAX_PAYLOAD, 0,  (struct sockaddr *)addr, sizeof(*addr));
+                }
             }
         }
-
         else if (type == SERVER)
         {
             if(bytes_recvd > 0){
+                print_diag(in_pkt, RECV);
                 if (in_pkt->flags & SYN)
                 {
                     seq = (rand() % 1000 + 1);
-                    out_pkt->seq = htons(seq);
-                    out_pkt->flags = SYN | ACK;
-                    out_pkt->ack = htons(in_pkt->seq + 1);
-
+                    ack = ntohs(in_pkt->seq) + 1;
+                    fill_packet(out_pkt, seq, ack, SYN | ACK, buffer, input_len);
+                    print_diag(out_pkt, SEND);
                     sendto(sockfd, out_pkt, sizeof(packet) + MAX_PAYLOAD, 0, (struct sockaddr *)addr, sizeof(*addr));
+                }
+                else if(!connected){
+                    if (ntohs(in_pkt->seq) != ack || ntohs(in_pkt->seq) != 0){
+                        // Disard or store in buffer
+                    }
+                    else {
+                        ack = ntohs(in_pkt->seq) + 1;
+                        fill_packet(out_pkt, seq, ack, ACK, buffer, input_len);
+                        connected = true;
+                    }
+                }
+                else {
+
                 }
             }
         }
         
-        seq += input_len;
+        seq += 1;
     }
 }
                  

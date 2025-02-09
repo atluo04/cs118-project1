@@ -4,6 +4,7 @@
 #include <stdbool.h>
 #include <stdint.h>
 #include <stdio.h>
+#include <stdarg.h>
 
 // Maximum payload size
 #define MAX_PAYLOAD 1012
@@ -68,8 +69,17 @@ static inline int bit_count(packet* pkt) {
 }
 
 // Helpers
-static inline void print(char* txt) {
-    fprintf(stderr, "%s\n", txt);
+// static inline void print(char* txt) {
+//     fprintf(stderr, "%s\n", txt);
+// }
+
+static inline void print(const char *format, ...)
+{
+    va_list args;
+    va_start(args, format);
+    vfprintf(stderr, format, args);
+    fprintf(stderr, "\n"); // Ensure newline at the end
+    va_end(args);
 }
 
 static inline void print_diag(packet* pkt, int diag) {
