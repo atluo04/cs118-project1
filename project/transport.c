@@ -89,6 +89,7 @@ int remove_sent_packets(Buffer *buffer, int ack)
         buffer->head = current;
         removed += ntohs(previous->pkt->length);
         print("Removed %d", ntohs(previous->pkt->seq));
+        free(previous->pkt);
         free(previous);
     }
 
@@ -100,6 +101,16 @@ int output_packet(Buffer *buffer, int ack, void (*output_p)(uint8_t *, size_t))
     BufferNode *previous = NULL;
     BufferNode *current = buffer->head;
 
+    while (current && ntohs(current->pkt->seq) == ack){
+        previous = current;
+        current = current->next;
+        buffer->head = current;
+        output_p(previous->pkt->payload, ntohs(previous->pkt->length));
+        free(previous->pkt);
+        free(previous);
+        ack += 1;
+    }
+    return ack;
 }
 
 void print_buffer(Buffer* buffer){
@@ -134,7 +145,8 @@ void listen_loop(int sockfd, struct sockaddr_in* addr, int type,
     while (true) {
         socklen_t addr_len = sizeof(struct sockaddr_in);
 
-        packet *in_pkt = (packet *)malloc(sizeof(packet) + MAX_PAYLOAD);
+        char in_buf[sizeof(packet) + MAX_PAYLOAD] = {0};
+        packet *in_pkt = (packet *)in_buf;
 
         int bytes_recvd = recvfrom(sockfd, in_pkt, sizeof(packet) + MAX_PAYLOAD, 0,
                                    (struct sockaddr *)addr, &addr_len);
@@ -147,17 +159,17 @@ void listen_loop(int sockfd, struct sockaddr_in* addr, int type,
             print_diag(in_pkt, RECV);
             window_size = ntohs(in_pkt->win);
             if(connected > 1){
-                // sent_bytes -= remove_sent_packets(&send_buffer, ntohs(in_pkt->ack));
+                sent_bytes -= remove_sent_packets(&send_buffer, ntohs(in_pkt->ack));
                 if (current_pkt)
                 {
                     current_pkt->pkt->ack = ntohs(ack);
                     current_pkt->pkt->flags |= ACK;
                 }
-                add_packet(&recv_buffer, in_pkt);
+                packet *pkt = (packet *)malloc(sizeof(packet) + ntohs(in_pkt->length));
+                memcpy(pkt, in_pkt, sizeof(packet) + ntohs(in_pkt->length));
+                add_packet(&recv_buffer, pkt);
+                ack = output_packet(&recv_buffer, ack, output_p);
             }
-        }
-        else{
-            free(in_pkt);
         }
         if(type == CLIENT && connected < 2)
         {
@@ -168,6 +180,7 @@ void listen_loop(int sockfd, struct sockaddr_in* addr, int type,
                 packet* syn_pkt = create_packet(seq, 0, SYN, MAX_WINDOW, buffer, input_len);
                 print_diag(syn_pkt, SEND);
                 sendto(sockfd, syn_pkt, sizeof(packet) + input_len, 0, (struct sockaddr *)addr, sizeof(*addr));
+                free(syn_pkt);
                 connected = 1;
                 seq += 1;
             }
@@ -179,14 +192,14 @@ void listen_loop(int sockfd, struct sockaddr_in* addr, int type,
                     output_p(in_pkt->payload, ntohs(in_pkt->length));
                 }
                 ack = ntohs(in_pkt->seq) + 1;
-
-                if (input_p((uint8_t *)buffer, MAX_PAYLOAD)== 0)
+                if (input_len)
                 {
                     seq = 0;
                 }
                 packet* ack_pkt = create_packet(seq, ack, ACK, MAX_WINDOW, buffer, input_len);
                 print_diag(ack_pkt, SEND);
                 sendto(sockfd, ack_pkt, sizeof(packet) + input_len, 0,  (struct sockaddr *)addr, sizeof(*addr));
+                free(ack_pkt);
                 connected = 2;
                 seq += 1;
             }
@@ -194,9 +207,10 @@ void listen_loop(int sockfd, struct sockaddr_in* addr, int type,
         else if (type == SERVER && connected < 2)
         {
             if(bytes_recvd > 0){
-                ssize_t input_len = input_p((uint8_t *)buffer, MAX_PAYLOAD);
                 if (in_pkt->flags & SYN)
                 {
+                    ssize_t input_len = input_p((uint8_t *)buffer, MAX_PAYLOAD);
+
                     seq = (rand() % 1000 + 1);
                     ack = ntohs(in_pkt->seq) + 1;
                     if (ntohs(in_pkt->length) > 0)
@@ -206,6 +220,7 @@ void listen_loop(int sockfd, struct sockaddr_in* addr, int type,
                     packet* synack_pkt = create_packet(seq, ack, SYN | ACK, MAX_WINDOW, buffer, input_len);
                     print_diag(synack_pkt, SEND);
                     sendto(sockfd, synack_pkt, sizeof(packet) + input_len, 0, (struct sockaddr *)addr, sizeof(*addr));
+                    free(synack_pkt);
                     connected = 1;
                     seq += 1;
                 }
