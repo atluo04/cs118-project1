@@ -48,6 +48,18 @@ typedef struct {
     uint8_t payload[0];
 } packet;
 
+typedef struct
+{
+    packet *pkt;
+    struct BufferNode *next;
+} BufferNode;
+
+typedef struct
+{
+    BufferNode *head;
+    BufferNode* tail;
+} Buffer;
+
 // Bit counter
 static inline int bit_count(packet* pkt) {
     uint8_t* bytes = (uint8_t*) pkt;
