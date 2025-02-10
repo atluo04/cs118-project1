@@ -100,8 +100,12 @@ int output_packet(Buffer *buffer, int ack, void (*output_p)(uint8_t *, size_t))
 {
     BufferNode *previous = NULL;
     BufferNode *current = buffer->head;
-
+    // print("BUFFER IS FOLLOWING:");
+    // print_buffer(buffer);
     while (current && ntohs(current->pkt->seq) == ack){
+        // print("Current ACK: %d", ack);
+        // print("Current Packet SEQ: %d", ntohs(current->pkt->seq));
+
         previous = current;
         current = current->next;
         buffer->head = current;
@@ -139,7 +143,7 @@ void listen_loop(int sockfd, struct sockaddr_in* addr, int type,
     init_buffer(&recv_buffer);
 
     int sent_bytes = 0;
-    int window_size = 0;
+    int window_size = MIN_WINDOW;
     BufferNode *current_pkt = NULL;
 
     while (true) {
@@ -158,8 +162,8 @@ void listen_loop(int sockfd, struct sockaddr_in* addr, int type,
             }
             print_diag(in_pkt, RECV);
             window_size = ntohs(in_pkt->win);
+            sent_bytes -= remove_sent_packets(&send_buffer, ntohs(in_pkt->ack));
             if(connected > 1){
-                sent_bytes -= remove_sent_packets(&send_buffer, ntohs(in_pkt->ack));
                 if (current_pkt)
                 {
                     current_pkt->pkt->ack = ntohs(ack);
@@ -178,9 +182,8 @@ void listen_loop(int sockfd, struct sockaddr_in* addr, int type,
                 ssize_t input_len = input_p((uint8_t *)buffer, MAX_PAYLOAD);
                 seq = (rand() % 1000 + 1);
                 packet* syn_pkt = create_packet(seq, 0, SYN, MAX_WINDOW, buffer, input_len);
-                print_diag(syn_pkt, SEND);
-                sendto(sockfd, syn_pkt, sizeof(packet) + input_len, 0, (struct sockaddr *)addr, sizeof(*addr));
-                free(syn_pkt);
+                add_packet(&send_buffer, syn_pkt);
+                current_pkt = send_buffer.head;
                 connected = 1;
                 seq += 1;
             }
@@ -197,9 +200,8 @@ void listen_loop(int sockfd, struct sockaddr_in* addr, int type,
                     seq = 0;
                 }
                 packet* ack_pkt = create_packet(seq, ack, ACK, MAX_WINDOW, buffer, input_len);
-                print_diag(ack_pkt, SEND);
-                sendto(sockfd, ack_pkt, sizeof(packet) + input_len, 0,  (struct sockaddr *)addr, sizeof(*addr));
-                free(ack_pkt);
+                add_packet(&send_buffer, ack_pkt);
+                current_pkt = send_buffer.tail;
                 connected = 2;
                 seq += 1;
             }
@@ -218,9 +220,8 @@ void listen_loop(int sockfd, struct sockaddr_in* addr, int type,
                         output_p(in_pkt->payload, ntohs(in_pkt->length));
                     }
                     packet* synack_pkt = create_packet(seq, ack, SYN | ACK, MAX_WINDOW, buffer, input_len);
-                    print_diag(synack_pkt, SEND);
-                    sendto(sockfd, synack_pkt, sizeof(packet) + input_len, 0, (struct sockaddr *)addr, sizeof(*addr));
-                    free(synack_pkt);
+                    add_packet(&send_buffer, synack_pkt);
+                    current_pkt = send_buffer.tail;
                     connected = 1;
                     seq += 1;
                 }
@@ -251,13 +252,14 @@ void listen_loop(int sockfd, struct sockaddr_in* addr, int type,
                 seq += 1;
             }
 
-            if (current_pkt != NULL && sent_bytes + ntohs(current_pkt->pkt->length) <= window_size){
-                // current_pkt->pkt->seq = htons(seq);
-                print_diag(current_pkt->pkt, SEND);
-                sendto(sockfd, current_pkt->pkt, sizeof(packet) + ntohs(current_pkt->pkt->length), 0, (struct sockaddr *)addr, sizeof(*addr));
-                sent_bytes +=  ntohs(current_pkt->pkt->length);
-                current_pkt = current_pkt->next;
-            }
+        }
+        if (current_pkt != NULL && sent_bytes + ntohs(current_pkt->pkt->length) <= window_size)
+        {
+            // current_pkt->pkt->seq = htons(seq);
+            print_diag(current_pkt->pkt, SEND);
+            sendto(sockfd, current_pkt->pkt, sizeof(packet) + ntohs(current_pkt->pkt->length), 0, (struct sockaddr *)addr, sizeof(*addr));
+            sent_bytes += ntohs(current_pkt->pkt->length);
+            current_pkt = current_pkt->next;
         }
     }
 }
