@@ -7,12 +7,12 @@
 #include <sys/socket.h>
 #include <unistd.h>
 
+
 int main(int argc, char** argv) {
     if (argc < 2) {
         fprintf(stderr, "Usage: server <port>\n");
         exit(1);
     }
-
     /* Create sockets */
     int sockfd = socket(AF_INET, SOCK_DGRAM, 0);
     // use IPv4  use UDP
@@ -26,18 +26,16 @@ int main(int argc, char** argv) {
     // Set receiving port
     int PORT = atoi(argv[1]);
     server_addr.sin_port = htons(PORT); // Big endian
-
     /* Let operating system know about our config */
     int did_bind =
         bind(sockfd, (struct sockaddr*) &server_addr, sizeof(server_addr));
-
+    
     struct sockaddr_in client_addr; // Same information, but about client
     socklen_t s = sizeof(struct sockaddr_in);
     char buffer;
-
     // Wait for client connection
     int bytes_recvd = recvfrom(sockfd, &buffer, sizeof(buffer), MSG_PEEK,
-                               (struct sockaddr*) &client_addr, &s);
+                               (struct sockaddr*)&client_addr, &s);
 
     init_io();
     listen_loop(sockfd, &client_addr, SERVER, input_io, output_io);
