@@ -183,6 +183,7 @@ void listen_loop(int sockfd, struct sockaddr_in *addr, int type,
                 continue;
             }
             window_size = ntohs(in_pkt->win);
+            // Process received ACK
             if(in_pkt->flags &= ACK | SYN){
                 uint16_t new_ack = ntohs(in_pkt->ack);
                 if(received_ack == new_ack){
@@ -200,11 +201,13 @@ void listen_loop(int sockfd, struct sockaddr_in *addr, int type,
                     received_ack = new_ack;
                     ack_count = 0;
                     // No packets left in sending buffer, stop timer
+                    gettimeofday(&timer, NULL);
                     if(send_buffer.head == NULL){
                         timer_running = false;
                     }
                 }
             }
+            // Add received packet to receiving buffer
             if(connected > 1){
                 packet *pkt = (packet *)malloc(sizeof(packet) + ntohs(in_pkt->length));
                 memcpy(pkt, in_pkt, sizeof(packet) + ntohs(in_pkt->length));
@@ -297,6 +300,7 @@ void listen_loop(int sockfd, struct sockaddr_in *addr, int type,
         }
         else
         {
+            // Create packet from stdin data and add to send buffer
             ssize_t input_len = input_p((uint8_t *)buffer, MAX_PAYLOAD);
 
             if(input_len > 0){
@@ -316,9 +320,9 @@ void listen_loop(int sockfd, struct sockaddr_in *addr, int type,
         if (timer_running && TV_DIFF(now, timer) >= RTO && send_buffer.head){
             packet *retransmit_pkt = send_buffer.head->pkt;
             send_packet(sockfd, addr, retransmit_pkt, RTOS);
-            gettimeofday(&timer, NULL);
+            // gettimeofday(&timer, NULL);
         }
-
+        // Send queued packet in send buffer
         if (current_pkt != NULL && sent_bytes + ntohs(current_pkt->pkt->length) <= window_size)
         {
             if (received_packet)
@@ -337,6 +341,7 @@ void listen_loop(int sockfd, struct sockaddr_in *addr, int type,
         }
         else if (received_packet)
         {
+            // Send dedicated ACK packet
             packet* ack_pkt = create_packet(0, ack, ACK, MAX_WINDOW, NULL, 0);
             // print("Sending dedicated ack packet: ");
             send_packet(sockfd, addr, ack_pkt, SEND);
