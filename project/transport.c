@@ -4,6 +4,7 @@
 #include "consts.h"
 #include <fcntl.h>
 #include <time.h>
+#include <sys/time.h>
 #include <errno.h>
 
 uint8_t compute_xor_checksum(const void *data, size_t size)
@@ -12,7 +13,11 @@ uint8_t compute_xor_checksum(const void *data, size_t size)
     uint8_t checksum = 0;
     for (size_t i = 0; i < size; i++)
     {
-        checksum ^= bytes[i]; 
+        uint8_t byte = bytes[i];
+        for (int j = 0; j < 8; j++) 
+        {
+            checksum ^= (byte >> j) & 1;
+        }
     }
     return checksum;
 }
@@ -26,7 +31,7 @@ void init_buffer(Buffer *buffer)
 packet *create_packet(uint16_t seq, uint16_t ack, uint16_t flags, uint16_t win, uint8_t *payload, size_t payload_len)
 {
     packet *pkt = (packet *)malloc(sizeof(packet) + payload_len);
-
+    memset(pkt, 0, sizeof(packet));
     pkt->seq = htons(seq);
     pkt->ack = htons(ack);
     pkt->flags = flags;
@@ -39,7 +44,7 @@ packet *create_packet(uint16_t seq, uint16_t ack, uint16_t flags, uint16_t win, 
     }
     else
     {
-        memset(pkt->payload, 0, MAX_PAYLOAD);
+        memset(pkt->payload, 0, 0);
         pkt->length = 0;
     }
     if (compute_xor_checksum(pkt, sizeof(packet) + payload_len))
@@ -88,7 +93,6 @@ int remove_sent_packets(Buffer *buffer, int ack)
         current = current->next;
         buffer->head = current;
         removed += ntohs(previous->pkt->length);
-        print("Removed %d", ntohs(previous->pkt->seq));
         free(previous->pkt);
         free(previous);
     }
@@ -96,7 +100,7 @@ int remove_sent_packets(Buffer *buffer, int ack)
     return removed;
 }
 
-int output_packet(Buffer *buffer, int ack, void (*output_p)(uint8_t *, size_t))
+int output_packet(Buffer *buffer, uint16_t ack, void (*output_p)(uint8_t *, size_t))
 {
     BufferNode *previous = NULL;
     BufferNode *current = buffer->head;
@@ -117,22 +121,29 @@ int output_packet(Buffer *buffer, int ack, void (*output_p)(uint8_t *, size_t))
     return ack;
 }
 
-void print_buffer(Buffer* buffer){
-    BufferNode* current = buffer->head;
-    while(current != NULL){
-        print("%d", ntohs(current->pkt->seq));
+void print_buffer(Buffer *buffer, const char *type)
+{
+    BufferNode *current = buffer->head;
+    fprintf(stderr, "%s BUF", type);  
+    while (current != NULL)
+    {
+        fprintf(stderr, " %d", ntohs(current->pkt->seq));  
         current = current->next;
     }
+    fprintf(stderr, "\n");  
 }
 
 // Main function of transport layer; never quits
 void listen_loop(int sockfd, struct sockaddr_in* addr, int type,
                  ssize_t (*input_p)(uint8_t*, size_t),
                  void (*output_p)(uint8_t*, size_t)) {
+
     char buffer[MAX_PAYLOAD];
     int connected = 0;
-    int seq = 0;
-    int ack = 0;
+    uint16_t seq = 0;
+    uint16_t ack = 0;
+    uint16_t received_ack = 0;
+    int ack_count = 0;
     srand(time(NULL) ^ type);
 
     fcntl(sockfd, F_SETFL, fcntl(sockfd, F_GETFL, 0) | O_NONBLOCK);
@@ -146,6 +157,9 @@ void listen_loop(int sockfd, struct sockaddr_in* addr, int type,
     int window_size = MIN_WINDOW;
     BufferNode *current_pkt = NULL;
 
+    struct timeval timer;
+    bool timer_running = false;
+
     while (true) {
         socklen_t addr_len = sizeof(struct sockaddr_in);
 
@@ -154,25 +168,51 @@ void listen_loop(int sockfd, struct sockaddr_in* addr, int type,
 
         int bytes_recvd = recvfrom(sockfd, in_pkt, sizeof(packet) + MAX_PAYLOAD, 0,
                                    (struct sockaddr *)addr, &addr_len);
+        bool received_packet = false;
 
         if(bytes_recvd > 0){
-            if (!compute_xor_checksum(in_pkt, bytes_recvd))
+            print_diag(in_pkt, RECV);
+            print_buffer(&recv_buffer, "RECV");
+            if (compute_xor_checksum(in_pkt, bytes_recvd))
             {
+                print("CORRUPT");
                 continue;
             }
-            print_diag(in_pkt, RECV);
             window_size = ntohs(in_pkt->win);
-            sent_bytes -= remove_sent_packets(&send_buffer, ntohs(in_pkt->ack));
-            if(connected > 1){
-                if (current_pkt)
-                {
-                    current_pkt->pkt->ack = ntohs(ack);
-                    current_pkt->pkt->flags |= ACK;
+            if(in_pkt->flags &= ACK | SYN){
+                uint16_t new_ack = ntohs(in_pkt->ack);
+                if(received_ack == new_ack){
+                    ack_count += 1;
+                    // Received 3 duplicate ACKs, retransmit lowest sequence packet in send buffer
+                    if (ack_count >= DUP_ACKS && send_buffer.head)
+                    {
+                        packet *retransmit_pkt = send_buffer.head->pkt;
+                        print_diag(retransmit_pkt, DUPS);
+                        sendto(sockfd, retransmit_pkt, sizeof(packet) + ntohs(retransmit_pkt->length), 0, (struct sockaddr *)addr, sizeof(*addr));
+                    }
                 }
+                else{
+                    // Received new ACK, remove packets from send buffer and renew timer
+                    sent_bytes -= remove_sent_packets(&send_buffer, ntohs(in_pkt->ack));
+                    received_ack = new_ack;
+                    ack_count = 0;
+                    // No packets left in sending buffer, stop timer
+                    if(send_buffer.head == NULL){
+                        timer_running = false;
+                    }
+                }
+            }
+            // Only add packets with payloads to receiving buffer, ignore dedicated ack packets
+            if(connected > 1 && ntohs(in_pkt->length) > 0){
                 packet *pkt = (packet *)malloc(sizeof(packet) + ntohs(in_pkt->length));
                 memcpy(pkt, in_pkt, sizeof(packet) + ntohs(in_pkt->length));
                 add_packet(&recv_buffer, pkt);
                 ack = output_packet(&recv_buffer, ack, output_p);
+                if (current_pkt)
+                {
+                    current_pkt->pkt->ack = ntohs(ack);
+                }
+                received_packet = true;
             }
         }
         if(type == CLIENT && connected < 2)
@@ -184,6 +224,8 @@ void listen_loop(int sockfd, struct sockaddr_in* addr, int type,
                 packet* syn_pkt = create_packet(seq, 0, SYN, MAX_WINDOW, buffer, input_len);
                 add_packet(&send_buffer, syn_pkt);
                 current_pkt = send_buffer.head;
+                gettimeofday(&timer, NULL);
+                timer_running = true;
                 connected = 1;
                 seq += 1;
             }
@@ -195,13 +237,15 @@ void listen_loop(int sockfd, struct sockaddr_in* addr, int type,
                     output_p(in_pkt->payload, ntohs(in_pkt->length));
                 }
                 ack = ntohs(in_pkt->seq) + 1;
-                if (input_len)
+                if (input_len == 0)
                 {
                     seq = 0;
                 }
                 packet* ack_pkt = create_packet(seq, ack, ACK, MAX_WINDOW, buffer, input_len);
                 add_packet(&send_buffer, ack_pkt);
                 current_pkt = send_buffer.tail;
+                gettimeofday(&timer, NULL);
+                timer_running = true;
                 connected = 2;
                 seq += 1;
             }
@@ -209,6 +253,7 @@ void listen_loop(int sockfd, struct sockaddr_in* addr, int type,
         else if (type == SERVER && connected < 2)
         {
             if(bytes_recvd > 0){
+                // Send SYNACK back to client
                 if (in_pkt->flags & SYN)
                 {
                     ssize_t input_len = input_p((uint8_t *)buffer, MAX_PAYLOAD);
@@ -222,6 +267,8 @@ void listen_loop(int sockfd, struct sockaddr_in* addr, int type,
                     packet* synack_pkt = create_packet(seq, ack, SYN | ACK, MAX_WINDOW, buffer, input_len);
                     add_packet(&send_buffer, synack_pkt);
                     current_pkt = send_buffer.tail;
+                    gettimeofday(&timer, NULL);
+                    timer_running = true;
                     connected = 1;
                     seq += 1;
                 }
@@ -243,7 +290,8 @@ void listen_loop(int sockfd, struct sockaddr_in* addr, int type,
             ssize_t input_len = input_p((uint8_t *)buffer, MAX_PAYLOAD);
 
             if(input_len > 0){
-                packet *pkt = create_packet(seq, 0, 0, MAX_WINDOW, buffer, input_len);
+                packet *pkt = create_packet(seq, ack, 0, MAX_WINDOW, buffer, input_len);
+                print_buffer(&send_buffer, "SEND");
                 add_packet(&send_buffer, pkt);
                 if (current_pkt == NULL)
                 {
@@ -253,13 +301,41 @@ void listen_loop(int sockfd, struct sockaddr_in* addr, int type,
             }
 
         }
+        struct timeval now;
+        gettimeofday(&now, NULL);
+        // Timer has expired, resend packet
+        if (timer_running && TV_DIFF(now, timer) >= RTO && send_buffer.head){
+            packet *retransmit_pkt = send_buffer.head->pkt;
+            print_diag(retransmit_pkt, RTOS);
+            sendto(sockfd, retransmit_pkt, sizeof(packet) + ntohs(retransmit_pkt->length), 0, (struct sockaddr *)addr, sizeof(*addr));
+            gettimeofday(&timer, NULL);
+        }
+
         if (current_pkt != NULL && sent_bytes + ntohs(current_pkt->pkt->length) <= window_size)
         {
-            // current_pkt->pkt->seq = htons(seq);
             print_diag(current_pkt->pkt, SEND);
+            if (received_packet)
+            {
+                current_pkt->pkt->flags |= ACK;
+                // Since we are adding the ACK in after, remove Parity bit
+                if(compute_xor_checksum(current_pkt->pkt, sizeof(packet) + ntohs(current_pkt->pkt->length))){
+                    current_pkt->pkt->flags &= 0b100;
+                }
+            }
             sendto(sockfd, current_pkt->pkt, sizeof(packet) + ntohs(current_pkt->pkt->length), 0, (struct sockaddr *)addr, sizeof(*addr));
             sent_bytes += ntohs(current_pkt->pkt->length);
             current_pkt = current_pkt->next;
+            // If timer was stopped, restart packet because of newly transmitted packet
+            if(!timer_running){
+                gettimeofday(&timer, NULL);
+                timer_running = true;
+            }
+        }
+        else if (received_packet)
+        {
+            packet* ack_pkt = create_packet(seq, ack, ACK, MAX_WINDOW, NULL, 0);
+            print_diag(ack_pkt, SEND);
+            sendto(sockfd, ack_pkt, sizeof(packet) + ntohs(ack_pkt->length), 0, (struct sockaddr *)addr, sizeof(*addr));
         }
     }
 }
