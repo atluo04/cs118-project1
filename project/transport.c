@@ -22,6 +22,16 @@ uint8_t compute_xor_checksum(const void *data, size_t size)
     return checksum;
 }
 
+int send_packet(int sockfd, struct sockaddr_in *addr, packet *pkt, int diag)
+{
+    if (compute_xor_checksum(pkt, sizeof(packet) + ntohs(pkt->length)))
+    {
+        pkt->flags |= PARITY;
+    }
+    print_diag(pkt, diag);
+    return sendto(sockfd, pkt, sizeof(packet) + ntohs(pkt->length), 0, (struct sockaddr *)addr, sizeof(*addr));
+}
+
 void init_buffer(Buffer *buffer)
 {
     buffer->head = NULL;
@@ -46,10 +56,6 @@ packet *create_packet(uint16_t seq, uint16_t ack, uint16_t flags, uint16_t win, 
     {
         memset(pkt->payload, 0, 0);
         pkt->length = 0;
-    }
-    if (compute_xor_checksum(pkt, sizeof(packet) + payload_len))
-    {
-        pkt->flags |= PARITY;
     }
     return pkt;
 }
@@ -104,12 +110,8 @@ int output_packet(Buffer *buffer, uint16_t ack, void (*output_p)(uint8_t *, size
 {
     BufferNode *previous = NULL;
     BufferNode *current = buffer->head;
-    // print("BUFFER IS FOLLOWING:");
-    // print_buffer(buffer);
-    while (current && ntohs(current->pkt->seq) == ack){
-        // print("Current ACK: %d", ack);
-        // print("Current Packet SEQ: %d", ntohs(current->pkt->seq));
 
+    while (current && ntohs(current->pkt->seq) == ack){
         previous = current;
         current = current->next;
         buffer->head = current;
@@ -133,10 +135,13 @@ void print_buffer(Buffer *buffer, const char *type)
     fprintf(stderr, "\n");  
 }
 
+
+
 // Main function of transport layer; never quits
-void listen_loop(int sockfd, struct sockaddr_in* addr, int type,
-                 ssize_t (*input_p)(uint8_t*, size_t),
-                 void (*output_p)(uint8_t*, size_t)) {
+void listen_loop(int sockfd, struct sockaddr_in *addr, int type,
+                     ssize_t (*input_p)(uint8_t *, size_t),
+                     void (*output_p)(uint8_t *, size_t))
+{
 
     char buffer[MAX_PAYLOAD];
     int connected = 0;
@@ -172,7 +177,6 @@ void listen_loop(int sockfd, struct sockaddr_in* addr, int type,
 
         if(bytes_recvd > 0){
             print_diag(in_pkt, RECV);
-            print_buffer(&recv_buffer, "RECV");
             if (compute_xor_checksum(in_pkt, bytes_recvd))
             {
                 print("CORRUPT");
@@ -187,8 +191,7 @@ void listen_loop(int sockfd, struct sockaddr_in* addr, int type,
                     if (ack_count >= DUP_ACKS && send_buffer.head)
                     {
                         packet *retransmit_pkt = send_buffer.head->pkt;
-                        print_diag(retransmit_pkt, DUPS);
-                        sendto(sockfd, retransmit_pkt, sizeof(packet) + ntohs(retransmit_pkt->length), 0, (struct sockaddr *)addr, sizeof(*addr));
+                        send_packet(sockfd, addr, retransmit_pkt, DUPS);
                     }
                 }
                 else{
@@ -202,18 +205,25 @@ void listen_loop(int sockfd, struct sockaddr_in* addr, int type,
                     }
                 }
             }
-            // Only add packets with payloads to receiving buffer, ignore dedicated ack packets
-            if(connected > 1 && ntohs(in_pkt->length) > 0){
+            if(connected > 1){
                 packet *pkt = (packet *)malloc(sizeof(packet) + ntohs(in_pkt->length));
                 memcpy(pkt, in_pkt, sizeof(packet) + ntohs(in_pkt->length));
-                add_packet(&recv_buffer, pkt);
+
                 ack = output_packet(&recv_buffer, ack, output_p);
-                if (current_pkt)
-                {
-                    current_pkt->pkt->ack = ntohs(ack);
+
+                // Do not reACK a dedicated ACK packet
+                if(ntohs(in_pkt->length) > 0){
+                    if(ntohs(in_pkt->seq) >= ack){
+                        add_packet(&recv_buffer, pkt);
+                    }
+                    if (current_pkt)
+                    {
+                        current_pkt->pkt->ack = ntohs(ack);
+                    }
+                    received_packet = true;
                 }
-                received_packet = true;
             }
+            print_buffer(&recv_buffer, "RECV");
         }
         if(type == CLIENT && connected < 2)
         {
@@ -275,7 +285,7 @@ void listen_loop(int sockfd, struct sockaddr_in* addr, int type,
                 // Check if last ACK is part of three way handshake
                 else if (connected == 1 && (ntohs(in_pkt->seq) == 0 || ntohs(in_pkt->seq) == ack))
                 {
-                    print("Three-way Handshake Complete");
+                    // print("Three-way Handshake Complete");
                     if (ntohs(in_pkt->length) > 0)
                     {
                         output_p(in_pkt->payload, ntohs(in_pkt->length));
@@ -291,7 +301,6 @@ void listen_loop(int sockfd, struct sockaddr_in* addr, int type,
 
             if(input_len > 0){
                 packet *pkt = create_packet(seq, ack, 0, MAX_WINDOW, buffer, input_len);
-                print_buffer(&send_buffer, "SEND");
                 add_packet(&send_buffer, pkt);
                 if (current_pkt == NULL)
                 {
@@ -306,36 +315,31 @@ void listen_loop(int sockfd, struct sockaddr_in* addr, int type,
         // Timer has expired, resend packet
         if (timer_running && TV_DIFF(now, timer) >= RTO && send_buffer.head){
             packet *retransmit_pkt = send_buffer.head->pkt;
-            print_diag(retransmit_pkt, RTOS);
-            sendto(sockfd, retransmit_pkt, sizeof(packet) + ntohs(retransmit_pkt->length), 0, (struct sockaddr *)addr, sizeof(*addr));
+            send_packet(sockfd, addr, retransmit_pkt, RTOS);
             gettimeofday(&timer, NULL);
         }
 
         if (current_pkt != NULL && sent_bytes + ntohs(current_pkt->pkt->length) <= window_size)
         {
-            print_diag(current_pkt->pkt, SEND);
             if (received_packet)
             {
                 current_pkt->pkt->flags |= ACK;
-                // Since we are adding the ACK in after, remove Parity bit
-                if(compute_xor_checksum(current_pkt->pkt, sizeof(packet) + ntohs(current_pkt->pkt->length))){
-                    current_pkt->pkt->flags &= 0b100;
-                }
             }
-            sendto(sockfd, current_pkt->pkt, sizeof(packet) + ntohs(current_pkt->pkt->length), 0, (struct sockaddr *)addr, sizeof(*addr));
+            send_packet(sockfd, addr, current_pkt->pkt, SEND);
             sent_bytes += ntohs(current_pkt->pkt->length);
             current_pkt = current_pkt->next;
-            // If timer was stopped, restart packet because of newly transmitted packet
+            // If timer was stopped, restart timer because of newly transmitted packet
             if(!timer_running){
                 gettimeofday(&timer, NULL);
                 timer_running = true;
             }
+            print_buffer(&send_buffer, "SEND");
         }
         else if (received_packet)
         {
-            packet* ack_pkt = create_packet(seq, ack, ACK, MAX_WINDOW, NULL, 0);
-            print_diag(ack_pkt, SEND);
-            sendto(sockfd, ack_pkt, sizeof(packet) + ntohs(ack_pkt->length), 0, (struct sockaddr *)addr, sizeof(*addr));
+            packet* ack_pkt = create_packet(0, ack, ACK, MAX_WINDOW, NULL, 0);
+            // print("Sending dedicated ack packet: ");
+            send_packet(sockfd, addr, ack_pkt, SEND);
         }
     }
 }
